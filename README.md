@@ -73,7 +73,7 @@ CryptoLayer использует проверенные технологии и 
 
 * **[CryptoLayer Web UI](https://github.com/DaPon4ik/cryptolayer-webui)** — web-интерфейс для защищенного обмена сообщениями в мессенджерах.
 
-* **[zkgram](https://github.com/Gerate-Technik/zkgram)** — мессенджер, который работает поверх вашей существующей учетной записи Telegram.
+* **[zkgram](https://github.com/Gerate-Technik/zkgram)** — приватный клиент Telegram.
 
 > [!NOTE]
 > **Хотите добавить свой проект?**
