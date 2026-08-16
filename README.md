@@ -71,9 +71,9 @@ CryptoLayer использует проверенные технологии и 
 
 * **[CryptoLayer CLI](https://github.com/igmunv/cryptolayer-cli)** — официальный интерфейс для командной строки. Отлично подойдёт для работы в терминале.
 
-* **[CryptoLayer Web UI](https://github.com/DaPon4ik/cryptolayer-webui)** — web-интерфейс для защищенного обмена сообщениями в мессенджерах.
+* **[CryptoLayer Web UI](https://github.com/DaPon4ik/cryptolayer-webui)** — web-интерфейс для защищенного обмена сообщениями в мессенджерах. Удобный и красивый интерфейс.
 
-* **[zkgram](https://github.com/Gerate-Technik/zkgram)** — приватный клиент Telegram.
+* **[zkgram](https://github.com/Gerate-Technik/zkgram)** — приватный клиент Telegram. Подойдёт если необходимо удобное и безопасное общение только в Telegram.
 
 > [!NOTE]
 > **Хотите добавить свой проект?**
