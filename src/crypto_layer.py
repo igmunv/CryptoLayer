@@ -79,6 +79,12 @@ class CryptoLayer:
         # ECC public key собеседника
         self.COMPANION_PUBLIC_KEY = None
 
+        # Выставляются при получении соответствующих данных от собеседника.
+        # Ожидающий поток просыпается сразу, а не на следующем тике опроса
+        self.COMPANION_NODE_ID_RECEIVED = threading.Event()
+        self.COMPANION_SIGN_RECEIVED = threading.Event()
+        self.COMPANION_PUBLIC_KEY_RECEIVED = threading.Event()
+
         # Уровни
         self.TRANSITIONAL_LEVEL = None
         self.TRANSPORT_LEVEL = None
@@ -252,8 +258,7 @@ class CryptoLayer:
         self.APPLICATION_LEVEL.send_my_node_id(self.NODE_ID)
         self.ui_provider.update_status("Signatures", "Waiting for companion node id...", "in_progress")
         self.LOGGER.info("Signatures: Waiting for companion node id...")
-        while not self.COMPANION_NODE_ID:
-            time.sleep(0.1)
+        self.COMPANION_NODE_ID_RECEIVED.wait()
         self.ui_provider.update_status("Signatures", "Companion node id received!", "in_progress")
         self.LOGGER.info("Signatures: Companion node id received!")
 
@@ -271,8 +276,7 @@ class CryptoLayer:
             self.APPLICATION_LEVEL.send_my_sign(my_sign_public_bytes_X962)
             self.ui_provider.update_status("Signatures", "Waiting for companion signature...", "in_progress")
             self.LOGGER.info("Signatures: Waiting for companion signature...")
-            while not self.COMPANION_SIGN:
-                time.sleep(0.1)
+            self.COMPANION_SIGN_RECEIVED.wait()
             self.ui_provider.update_status("Signatures", "Companion signature received!", "in_progress")
             self.LOGGER.info("Signatures: Companion signature received!")
 
@@ -355,8 +359,7 @@ class CryptoLayer:
 
         self.ui_provider.update_status("Encryption", "Waiting for companion public key...", "in_progress")
         self.LOGGER.info("Encryption: Waiting for companion public key...")
-        while not self.COMPANION_PUBLIC_KEY:
-            time.sleep(0.1)
+        self.COMPANION_PUBLIC_KEY_RECEIVED.wait()
 
         self.ui_provider.update_status("Encryption", "Companion public key received!", "in_progress")
         self.LOGGER.info("Encryption: Companion public key received!")
@@ -379,6 +382,7 @@ class CryptoLayer:
 
     def receive_node_id(self, node_id: str):
         self.COMPANION_NODE_ID = node_id
+        self.COMPANION_NODE_ID_RECEIVED.set()
 
 
     def receive_sign(self, sign: bytes):
@@ -386,6 +390,7 @@ class CryptoLayer:
             ec.SECP256R1(),
             sign
         )
+        self.COMPANION_SIGN_RECEIVED.set()
 
 
     def receive_public_key(self, public_key: bytes):
@@ -393,6 +398,7 @@ class CryptoLayer:
             ec.SECP256R1(),
             public_key
         )
+        self.COMPANION_PUBLIC_KEY_RECEIVED.set()
 
 
     def receive_text(self, timestamp: int, text: str):
@@ -490,7 +496,8 @@ class CryptoLayer:
 
         # Ожидаем отправления всех пакетов
         timeout = 30
-        while len(self.TRANSPORT_LEVEL.PENDING_ACK_PACKS) > 0 or len(self.APPLICATION_LEVEL.PENDING_SEND_BUF) > 0 or len(self.PRESENTATION_LEVEL.PENDING_SEND_BUF) > 0 or len(self.TRANSPORT_LEVEL.PENDING_SEND_BUF) > 0 or len(self.TRANSITIONAL_LEVEL.PENDING_SEND_BUF) > 0:
+        levels = (self.APPLICATION_LEVEL, self.PRESENTATION_LEVEL, self.TRANSPORT_LEVEL, self.TRANSITIONAL_LEVEL)
+        while self.TRANSPORT_LEVEL.PENDING_ACK_PACKS or any(level.PENDING_SEND_BUF.qsize() for level in levels):
 
             if timeout <= 0:
                 break

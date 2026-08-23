@@ -1,5 +1,5 @@
+import queue
 import threading
-import time
 import logging
 
 
@@ -10,15 +10,17 @@ class Base:
     # Здесь класс CryptoLayer. Это нужно для обратной связи от уровней
     core = None
 
+    # Как долго рабочий поток ждёт данные, прежде чем перепроверить stop_event.
+    # На задержку доставки не влияет: Queue будит поток сразу при put().
+    POLL_TIMEOUT = 0.1
+
     def __init__(self):
 
         # Буффер пришедших данных
-        self.PENDING_PROCESSING_BUF = []
-        self.PEND_PROC_BUF_LOCK = threading.Lock()
+        self.PENDING_PROCESSING_BUF = queue.Queue()
 
         # Буффер готовых к передаче данных
-        self.PENDING_SEND_BUF = []
-        self.PEND_SEND_BUF_LOCK = threading.Lock()
+        self.PENDING_SEND_BUF = queue.Queue()
 
 
         self.logger = logging.getLogger(f"{self.__class__.__module__}.{self.__class__.__name__}")
@@ -42,27 +44,35 @@ class Base:
     # PUBLIC фунция: её вызывает верхний уровень: отправь эти данные
     def send(self, data):
         self.logger.info(f"size: {len(data)}")
-        with self.PEND_SEND_BUF_LOCK:
-            self.PENDING_SEND_BUF.append(data)
+        self.PENDING_SEND_BUF.put(data)
 
 
     # PUBLIC фунция: её вызывает нижний уровень: получай эти данные
     def receive(self, data):
         self.logger.info(f"size: {len(data)}")
-        with self.PEND_PROC_BUF_LOCK:
-            self.PENDING_PROCESSING_BUF.append(data)
+        self.PENDING_PROCESSING_BUF.put(data)
+
+
+    # Отдаёт рабочей функции всё, что попадает в буффер, пока не выставлен stop_event.
+    # Обработчик вызывается вне блокировки буффера: transport ждёт подтверждения
+    # секундами, и держать буффер занятым всё это время значит застопорить уровни выше.
+    def _pump(self, buffer, worker):
+        while not self.stop_event.is_set():
+            try:
+                data = buffer.get(timeout=self.POLL_TIMEOUT)
+            except queue.Empty:
+                continue
+            self.logger.info(f"size: {len(data)}")
+            try:
+                worker(data)
+            except Exception:
+                # Иначе исключение убивает поток и уровень молча замолкает навсегда
+                self.logger.exception("worker failed, data dropped")
 
 
     # постоянно читает данные из PENDING_PROCESSING_BUF
     def receiver(self):
-        while not self.stop_event.is_set():
-            with self.PEND_PROC_BUF_LOCK:
-                if self.PENDING_PROCESSING_BUF:
-                    data = self.PENDING_PROCESSING_BUF[0]
-                    self.logger.info(f"size: {len(data)}")
-                    self.rworker(data)
-                    del self.PENDING_PROCESSING_BUF[0]
-            time.sleep(0.1)
+        self._pump(self.PENDING_PROCESSING_BUF, self.rworker)
 
 
     # обрабатывает данные и отправляет выше
@@ -72,17 +82,9 @@ class Base:
 
     # постоянно читает PENDING_SEND_BUF
     def sender(self):
-        while not self.stop_event.is_set():
-            with self.PEND_SEND_BUF_LOCK:
-                if self.PENDING_SEND_BUF:
-                    data = self.PENDING_SEND_BUF[0]
-                    self.logger.info(f"size: {len(data)}")
-                    self.sworker(data)
-                    del self.PENDING_SEND_BUF[0]
-            time.sleep(0.1)
+        self._pump(self.PENDING_SEND_BUF, self.sworker)
+
 
     # формирует пакет и отправляет данные ниже
     def sworker(self, data):
         pass
-
-
