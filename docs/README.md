@@ -1,5 +1,7 @@
 # Документация
 
+Русский • [English](README_en.md)
+
 ## Содержание
 
 - [1. О CryptoLayer](#1-о-cryptolayer)
