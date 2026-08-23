@@ -102,27 +102,40 @@ class Transport(Base):
     # Отправляем пакет и ожидаем подтверждение его получения
     def send_with_pending_acknowledgment(self, raw_packet_bytes, packet_hash):
 
-        with self.PENDING_ACK_PACKS_LOCK:
-            self.PENDING_ACK_PACKS[packet_hash] = 0
-
-        self.logger.info(f"send packet '{packet_hash}'")
-        self.LOWER_LEVEL.send(raw_packet_bytes)
-
-        while packet_hash in self.PENDING_ACK_PACKS and not self.stop_event.is_set():
-
-            self.logger.info(f"wait ack...")
-
-            if self.PENDING_ACK_PACKS.get(packet_hash, 0) >= 30:
-                self.logger.warning(f"timeout while wait ack")
-                self.send_with_pending_acknowledgment(raw_packet_bytes, packet_hash)
-                return
+        # Повторная отправка выполняется циклом, а не рекурсивным вызовом:
+        # на долго недоступном собеседнике рекурсия упиралась в предел глубины
+        while not self.stop_event.is_set():
 
             with self.PENDING_ACK_PACKS_LOCK:
-                self.PENDING_ACK_PACKS[packet_hash] = self.PENDING_ACK_PACKS[packet_hash] + 0.5
+                self.PENDING_ACK_PACKS[packet_hash] = 0
 
-            time.sleep(0.5)
+            self.logger.info(f"send packet '{packet_hash}'")
+            self.LOWER_LEVEL.send(raw_packet_bytes)
 
-        self.logger.info(f"ack received!")
+            timeout = False
+
+            while packet_hash in self.PENDING_ACK_PACKS and not self.stop_event.is_set():
+
+                self.logger.info(f"wait ack...")
+
+                with self.PENDING_ACK_PACKS_LOCK:
+
+                    # Подтверждение могло прийти между проверкой в while и захватом замка
+                    if packet_hash not in self.PENDING_ACK_PACKS:
+                        break
+
+                    if self.PENDING_ACK_PACKS[packet_hash] >= 30:
+                        self.logger.warning(f"timeout while wait ack")
+                        timeout = True
+                        break
+
+                    self.PENDING_ACK_PACKS[packet_hash] = self.PENDING_ACK_PACKS[packet_hash] + 0.5
+
+                time.sleep(0.5)
+
+            if not timeout:
+                self.logger.info(f"ack received!")
+                return
 
 
     # постоянно читает данные из PENDING_PROCESSING_BUF и обрабатывает их и отправляет выше
@@ -170,22 +183,30 @@ class Transport(Base):
             self.logger.info(f"data packet")
 
             if packet.stream_id not in self.WAITING_STREAMS:
-                self.WAITING_STREAMS[packet.stream_id] = {"count": packet.chunk_count, "packets": []}
-            self.WAITING_STREAMS[packet.stream_id]["packets"].append({"chunk_id": packet.chunk_id, "payload": packet.payload})
+                self.WAITING_STREAMS[packet.stream_id] = {"count": packet.chunk_count, "packets": {}}
 
-            self.logger.info(f"stream {packet.stream_id}: {len(self.WAITING_STREAMS[packet.stream_id]['packets'])} packet of {self.WAITING_STREAMS[packet.stream_id]['count']}")
+            stream = self.WAITING_STREAMS[packet.stream_id]
+
+            # Чанки хранятся по chunk_id: повторно доставленный чанк
+            # (например, при потере подтверждения) не считается новым
+            stream["packets"][packet.chunk_id] = packet.payload
+
+            self.logger.info(f"stream {packet.stream_id}: {len(stream['packets'])} packet of {stream['count']}")
 
             # Отправка подтверждения о получении пакета
             self.send_acknowledgment(data)
 
-            if self.WAITING_STREAMS[packet.stream_id]["count"] == len(self.WAITING_STREAMS[packet.stream_id]["packets"]):
+            if stream["count"] == len(stream["packets"]):
 
                 self.logger.info(f"all packets for this stream have been received!")
 
-                sorted_packets = sorted(self.WAITING_STREAMS[packet.stream_id]["packets"], key=lambda x: x["chunk_id"])
                 data = bytes()
-                for _packet in sorted_packets:
-                    data += _packet['payload']
+                for chunk_id in sorted(stream["packets"]):
+                    data += stream["packets"][chunk_id]
+
+                # Поток собран: освобождаем его id, иначе следующий поток с тем же
+                # id (счётчик идёт по кругу в пределах байта) допишется к этому
+                del self.WAITING_STREAMS[packet.stream_id]
 
                 # Передаем выше
                 self.UPPER_LEVEL.receive(data)
