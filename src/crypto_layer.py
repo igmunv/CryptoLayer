@@ -2,6 +2,7 @@ import threading
 import sys
 import time
 import os
+import re
 import uuid
 import logging
 
@@ -21,6 +22,10 @@ from levels.base import Base
 import config
 
 from UIProvider import UIProvider
+
+
+# node id состоит только из шестнадцатеричных символов
+NODE_ID_PATTERN = re.compile(r"\A[0-9a-f]+\Z")
 
 
 class CryptoLayer:
@@ -173,7 +178,7 @@ class CryptoLayer:
 
         if os.path.exists(self.NODE_ID_FILE_PATH):
             node_id_file_content = open(self.NODE_ID_FILE_PATH, encoding="utf-8").read().strip()
-            if len(node_id_file_content) >= 64:
+            if self.check_node_id(node_id_file_content):
                 self.NODE_ID = node_id_file_content
                 return
 
@@ -277,7 +282,7 @@ class CryptoLayer:
             self.LOGGER.info("Signatures: Companion signature received!")
 
             # Затем сравнение с тем, что в файле
-            COMPANION_SIGN_FILE_PATH = os.path.join(self.KNOWN_NODES_DIR_PATH, self.COMPANION_NODE_ID)
+            COMPANION_SIGN_FILE_PATH = self.get_known_node_file_path(self.COMPANION_NODE_ID)
             if os.path.exists(COMPANION_SIGN_FILE_PATH):
                 self.ui_provider.update_status("Signatures", "Сompanion signature exists", "in_progress")
                 self.LOGGER.info("Signatures: Сompanion signature exists")
@@ -378,6 +383,13 @@ class CryptoLayer:
 
 
     def receive_node_id(self, node_id: str):
+
+        # node id собеседника приходит по сети и используется как имя файла
+        # в known_nodes, поэтому принимается только node id ожидаемого вида
+        if not self.check_node_id(node_id):
+            self.LOGGER.error("companion node id is not valid: dropped")
+            return
+
         self.COMPANION_NODE_ID = node_id
 
 
@@ -443,6 +455,23 @@ class CryptoLayer:
 
         aesgcm = AESGCM(up_aes_key)
         return aesgcm.decrypt(nonce, encrypted_data, associated_data=None)
+
+
+    # Проверка, что node id имеет ожидаемый вид: два uuid4 в шестнадцатеричном виде
+    def check_node_id(self, node_id: str) -> bool:
+        return len(node_id) == config.NODE_ID_LENGTH and NODE_ID_PATTERN.match(node_id) is not None
+
+
+    # Путь к файлу с подписью узла внутри known_nodes.
+    # Дополнительная проверка на случай, если сюда попадёт непроверенный node id
+    def get_known_node_file_path(self, node_id: str) -> str:
+
+        file_path = os.path.join(self.KNOWN_NODES_DIR_PATH, node_id)
+
+        if os.path.dirname(os.path.realpath(file_path)) != os.path.realpath(self.KNOWN_NODES_DIR_PATH):
+            raise ValueError("node id points outside the known_nodes directory")
+
+        return file_path
 
 
     def load_key_from_X962_bytes(self, key_bytes):
