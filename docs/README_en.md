@@ -41,7 +41,7 @@ The library is an independent layer between the user and the messenger, which pr
 
 <br>
 <div align="center">
-<img src="docs/diagrams/how-it-works-small-EN.png" width="750" alt="How It Works">
+<img src="diagrams/how-it-works-small-EN.png" width="750" alt="How It Works">
 </div>
 <br>
 
@@ -53,7 +53,7 @@ You might immediately think about creating your own mega-secure messenger, but i
 
 <br>
 <div align="center">
-<img src="docs/diagrams/how-looks-data-transfer-EN.png" width="750" alt="How Looks Data Transfer">
+<img src="diagrams/how-looks-data-transfer-EN.png" width="750" alt="How Looks Data Transfer">
 </div>
 <br>
 
@@ -63,7 +63,7 @@ The library consists of three main parts: **Manager**, **pseudo-network layers**
 
 <br>
 <div align="center">
-<img src="docs/diagrams/arch-EN.png" width="750" alt="Architecture">
+<img src="diagrams/arch-EN.png" width="750" alt="Architecture">
 </div>
 <br>
 
@@ -75,7 +75,7 @@ Manages all the logic, as well as the pseudo-network layers. Performs initial se
 
 <br>
 <div align="center">
-<img src="docs/diagrams/net-levels-EN.png" width="750" alt="Net Levels">
+<img src="diagrams/net-levels-EN.png" width="750" alt="Net Levels">
 </div>
 <br>
 
@@ -400,7 +400,7 @@ Called when the interlocutor disconnects and ends communication. CryptoLayer con
 
 <br>
 <div align="center">
-<img src="docs/diagrams/init-EN.png" width="500" alt="Initialization">
+<img src="diagrams/init-EN.png" width="500" alt="Initialization">
 </div>
 <br>
 
@@ -436,7 +436,7 @@ When sending, the message passes through this pipeline. I see no point in descri
 
 <br>
 <div align="center">
-<img src="docs/diagrams/message-transmission-chain-EN.png" width="750" alt="ACK Receive Packet">
+<img src="diagrams/message-transmission-chain-EN.png" width="750" alt="ACK Receive Packet">
 </div>
 <br>
 
@@ -452,7 +452,7 @@ CryptoLayer has a packet delivery guarantee mechanism (analogous to TCP). This m
 
 <br>
 <div align="center">
-<img src="docs/diagrams/ack-receive-packet-EN.png" width="750" alt="ACK Receive Packet">
+<img src="diagrams/ack-receive-packet-EN.png" width="750" alt="ACK Receive Packet">
 </div>
 <br>
 
@@ -474,7 +474,7 @@ CryptoLayer implements its own pseudo-network stack. And each pseudo-network lay
 
 <br>
 <div align="center">
-<img src="docs/diagrams/packet-structures-EN.png" width="750" alt="Packet Structures">
+<img src="diagrams/packet-structures-EN.png" width="750" alt="Packet Structures">
 </div>
 <br>
 
