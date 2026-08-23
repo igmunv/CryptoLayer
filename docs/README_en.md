@@ -1,6 +1,6 @@
 # Documentation
 
-[Русский](docs/README.md) • English
+[Русский](README.md) • English
 
 ## Table of Contents
 
