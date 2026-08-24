@@ -2,8 +2,10 @@ import threading
 import sys
 import time
 import os
+import re
 import uuid
 import logging
+import hashlib
 
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
@@ -21,6 +23,10 @@ from levels.base import Base
 import config
 
 from UIProvider import UIProvider
+
+
+# node id состоит только из шестнадцатеричных символов
+NODE_ID_PATTERN = re.compile(r"\A[0-9a-f]+\Z")
 
 
 class CryptoLayer:
@@ -79,6 +85,12 @@ class CryptoLayer:
         # ECC public key собеседника
         self.COMPANION_PUBLIC_KEY = None
 
+        # Выставляются при получении соответствующих данных от собеседника.
+        # Ожидающий поток просыпается сразу, а не на следующем тике опроса
+        self.COMPANION_NODE_ID_RECEIVED = threading.Event()
+        self.COMPANION_SIGN_RECEIVED = threading.Event()
+        self.COMPANION_PUBLIC_KEY_RECEIVED = threading.Event()
+
         # Уровни
         self.TRANSITIONAL_LEVEL = None
         self.TRANSPORT_LEVEL = None
@@ -109,6 +121,9 @@ class CryptoLayer:
 
         # удаление пароля из RAM
         self.remove_password_from_ram()
+
+        # Стек готов: только теперь имеет смысл проверять доступность собеседника
+        self.TRANSPORT_LEVEL.enable_ping()
 
         self.ui_provider.on_ready()
 
@@ -173,7 +188,7 @@ class CryptoLayer:
 
         if os.path.exists(self.NODE_ID_FILE_PATH):
             node_id_file_content = open(self.NODE_ID_FILE_PATH, encoding="utf-8").read().strip()
-            if len(node_id_file_content) >= 64:
+            if self.check_node_id(node_id_file_content):
                 self.NODE_ID = node_id_file_content
                 return
 
@@ -252,8 +267,7 @@ class CryptoLayer:
         self.APPLICATION_LEVEL.send_my_node_id(self.NODE_ID)
         self.ui_provider.update_status("Signatures", "Waiting for companion node id...", "in_progress")
         self.LOGGER.info("Signatures: Waiting for companion node id...")
-        while not self.COMPANION_NODE_ID:
-            time.sleep(0.1)
+        self.COMPANION_NODE_ID_RECEIVED.wait()
         self.ui_provider.update_status("Signatures", "Companion node id received!", "in_progress")
         self.LOGGER.info("Signatures: Companion node id received!")
 
@@ -264,6 +278,11 @@ class CryptoLayer:
         # Отправка своей подписи
         # Ожидание подписи собеседника
 
+        # Станет True только если подпись собеседника действительно принята:
+        # либо совпала с ранее сохранённой, либо подтверждена пользователем.
+        # Управляет включением доверия в блоке finally ниже.
+        trust_ok = False
+
         try:
             self.ui_provider.update_status("Signatures", "Send signature...", "in_progress")
             self.LOGGER.info("Signatures: Send signature...")
@@ -271,13 +290,12 @@ class CryptoLayer:
             self.APPLICATION_LEVEL.send_my_sign(my_sign_public_bytes_X962)
             self.ui_provider.update_status("Signatures", "Waiting for companion signature...", "in_progress")
             self.LOGGER.info("Signatures: Waiting for companion signature...")
-            while not self.COMPANION_SIGN:
-                time.sleep(0.1)
+            self.COMPANION_SIGN_RECEIVED.wait()
             self.ui_provider.update_status("Signatures", "Companion signature received!", "in_progress")
             self.LOGGER.info("Signatures: Companion signature received!")
 
             # Затем сравнение с тем, что в файле
-            COMPANION_SIGN_FILE_PATH = os.path.join(self.KNOWN_NODES_DIR_PATH, self.COMPANION_NODE_ID)
+            COMPANION_SIGN_FILE_PATH = self.get_known_node_file_path(self.COMPANION_NODE_ID)
             if os.path.exists(COMPANION_SIGN_FILE_PATH):
                 self.ui_provider.update_status("Signatures", "Сompanion signature exists", "in_progress")
                 self.LOGGER.info("Signatures: Сompanion signature exists")
@@ -294,6 +312,8 @@ class CryptoLayer:
                         # Все норм они равны. Можем переходить к следующему этапу
                         self.ui_provider.update_status("Signatures", "Companion signature exists", "in_progress")
                         self.LOGGER.info("Signatures: Companion signature exists")
+                        # Подпись совпала с ранее сохранённой для этого узла - доверяем ей.
+                        trust_ok = True
                         return
 
                     else:
@@ -314,7 +334,7 @@ class CryptoLayer:
             self.LOGGER.info("Signatures: user signatures check...")
 
             # Проверка подписи собеседника пользователем
-            if self.ui_provider.check_signatures(self.get_firts_last_4_chars_sign(self.SIGN_PUBLIC_KEY), self.get_firts_last_4_chars_sign(self.COMPANION_SIGN)):
+            if self.ui_provider.check_signatures(self.get_sign_fingerprint(self.SIGN_PUBLIC_KEY), self.get_sign_fingerprint(self.COMPANION_SIGN)):
 
                 # Доверяем, записываем, используем эту подпись
 
@@ -325,13 +345,17 @@ class CryptoLayer:
                 comp_sign_public_bytes_X962 = self.get_key_bytes_X962(self.COMPANION_SIGN)
                 self.encrypt_write_file(COMPANION_SIGN_FILE_PATH, self.USER_PASSWORD, comp_sign_public_bytes_X962)
 
+                # Пользователь сверил отпечаток и подтвердил его - доверяем подписи.
+                trust_ok = True
+
 
             else:
                 raise TypeError("do not trust the signature")
 
         finally:
-            self.TRANSITIONAL_LEVEL.COMPANION_SIGN_PUBLIC_KEY = self.COMPANION_SIGN # обновляем подпись собеседника
-            self.TRANSITIONAL_LEVEL.DO_SIGN = True # ОБЯЗАТЕЛЬНО!!! Так как теперь используется подпись
+            if trust_ok:
+                self.TRANSITIONAL_LEVEL.COMPANION_SIGN_PUBLIC_KEY = self.COMPANION_SIGN # обновляем подпись собеседника
+                self.TRANSITIONAL_LEVEL.DO_SIGN = True # ОБЯЗАТЕЛЬНО!!! Так как теперь используется подпись
 
 
     # Генерация и обмен публичными ключами, вычисление симметриного ключа
@@ -347,6 +371,11 @@ class CryptoLayer:
                 format=serialization.PublicFormat.CompressedPoint
             )
 
+        # Всё, что пришло до включения обязательной проверки подписей, могло быть
+        # отправлено кем угодно. Отбрасываем такие данные и только после этого
+        # разрешаем приём ECDH-ключа собеседника
+        self.drop_unauthenticated_data()
+
         # Передача публичного ключа
         # Ожидаем публичный ключ от собеседника
         self.ui_provider.update_status("Encryption", "Send public key...", "in_progress")
@@ -355,8 +384,7 @@ class CryptoLayer:
 
         self.ui_provider.update_status("Encryption", "Waiting for companion public key...", "in_progress")
         self.LOGGER.info("Encryption: Waiting for companion public key...")
-        while not self.COMPANION_PUBLIC_KEY:
-            time.sleep(0.1)
+        self.COMPANION_PUBLIC_KEY_RECEIVED.wait()
 
         self.ui_provider.update_status("Encryption", "Companion public key received!", "in_progress")
         self.LOGGER.info("Encryption: Companion public key received!")
@@ -364,12 +392,44 @@ class CryptoLayer:
         # Вычисление симетричного ключа
         self.ui_provider.update_status("Encryption", "Symmetric key computation...", "in_progress")
         self.LOGGER.info("Encryption: Symmetric key computation...")
-        self.AES_KEY = self.MY_PRIVATE_KEY.exchange(ec.ECDH(), self.COMPANION_PUBLIC_KEY)
+        shared_secret = self.MY_PRIVATE_KEY.exchange(ec.ECDH(), self.COMPANION_PUBLIC_KEY)
+
+        # Результат ECDH - сам по себе он никак не привязан к тому, между кем
+        # шёл обмен. Поэтому не отдаём его в AES напрямую, а прогоняем через HKDF и
+        # подмешиваем в контекст оба публичных ключа и метку протокола. Порядок ключей
+        # фиксируем сортировкой, чтобы обе стороны независимо получили одинаковый
+        # контекст. В итоге ключ шифрования равномерный и жёстко связан именно с этой
+        # парой ключей и версией протокола: тот же секрет в другом контексте даст
+        # другой ключ, а переиспользовать секрет между сессиями не получится.
+        companion_public_key_bytes = self.get_key_bytes_X962(self.COMPANION_PUBLIC_KEY)
+        low_key, high_key = sorted((my_pkey_bytes, companion_public_key_bytes))
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"cryptolayer ecdh-aes256 v1\x00" + low_key + high_key,
+        )
+        self.AES_KEY = hkdf.derive(shared_secret)
 
         self.PRESENTATION_LEVEL.DO_ENCRYPT = True
         self.PRESENTATION_LEVEL.AES_KEY = self.AES_KEY
 
         self.ui_provider.update_status("Encryption", "Done", "success")
+
+
+    # Отбросить всё, что пришло до включения обязательной проверки подписей,
+    # и разрешить приём ECDH-ключа собеседника.
+    # Вызывать только после DO_SIGN = True: данные, ещё не дошедшие до переходного
+    # уровня, будут проверены при обработке, поэтому чистим только то, что этот
+    # уровень уже успел пропустить. Уровни чистятся снизу вверх
+    def drop_unauthenticated_data(self):
+
+        self.TRANSPORT_LEVEL.drop_pending_data()
+        self.PRESENTATION_LEVEL.take_pending_processing()
+
+        # Буфер прикладного уровня чистится внутри expect_public_key под тем же
+        # замком, под которым выполняется его rworker
+        self.APPLICATION_LEVEL.expect_public_key()
 
 
     # Отправка сообщения
@@ -378,7 +438,15 @@ class CryptoLayer:
 
 
     def receive_node_id(self, node_id: str):
+
+        # node id собеседника приходит по сети и используется как имя файла
+        # в known_nodes, поэтому принимается только node id ожидаемого вида
+        if not self.check_node_id(node_id):
+            self.LOGGER.error("companion node id is not valid: dropped")
+            return
+
         self.COMPANION_NODE_ID = node_id
+        self.COMPANION_NODE_ID_RECEIVED.set()
 
 
     def receive_sign(self, sign: bytes):
@@ -386,6 +454,7 @@ class CryptoLayer:
             ec.SECP256R1(),
             sign
         )
+        self.COMPANION_SIGN_RECEIVED.set()
 
 
     def receive_public_key(self, public_key: bytes):
@@ -393,6 +462,7 @@ class CryptoLayer:
             ec.SECP256R1(),
             public_key
         )
+        self.COMPANION_PUBLIC_KEY_RECEIVED.set()
 
 
     def receive_text(self, timestamp: int, text: str):
@@ -445,6 +515,23 @@ class CryptoLayer:
         return aesgcm.decrypt(nonce, encrypted_data, associated_data=None)
 
 
+    # Проверка, что node id имеет ожидаемый вид: два uuid4 в шестнадцатеричном виде
+    def check_node_id(self, node_id: str) -> bool:
+        return len(node_id) == config.NODE_ID_LENGTH and NODE_ID_PATTERN.match(node_id) is not None
+
+
+    # Путь к файлу с подписью узла внутри known_nodes.
+    # Дополнительная проверка на случай, если сюда попадёт непроверенный node id
+    def get_known_node_file_path(self, node_id: str) -> str:
+
+        file_path = os.path.join(self.KNOWN_NODES_DIR_PATH, node_id)
+
+        if os.path.dirname(os.path.realpath(file_path)) != os.path.realpath(self.KNOWN_NODES_DIR_PATH):
+            raise ValueError("node id points outside the known_nodes directory")
+
+        return file_path
+
+
     def load_key_from_X962_bytes(self, key_bytes):
         return ec.EllipticCurvePublicKey.from_encoded_point(
             curve=ec.SECP256R1(),
@@ -465,17 +552,20 @@ class CryptoLayer:
             self.USER_PASSWORD[i] = 0
 
 
-    # Получить первые и последние 4 байта подписи
-    def get_firts_last_4_chars_sign(self, sign):
+    # Отпечаток публичного ключа подписи, который пользователи сверяют вручную по
+    # доверенному каналу. Это единственная защита от подмены ключей в момент
+    # установления доверия, поэтому отпечаток обязан зависеть от всего ключа целиком.
+    def get_sign_fingerprint(self, sign):
 
-        sign_public_bytes_pem = sign.public_bytes(
+        sign_public_bytes = sign.public_bytes(
             encoding=serialization.Encoding.X962,
             format=serialization.PublicFormat.CompressedPoint
         )
 
-        first_4 = sign_public_bytes_pem[:4]
-        last_4 = sign_public_bytes_pem[-4:]
-        return f"{first_4.hex()}...{last_4.hex()}"
+        # Хэшируем ключ целиком через SHA-256 и показываем первые 160 бит
+        digest = hashlib.sha256(sign_public_bytes).digest()[:20]
+        hex_digest = digest.hex()
+        return " ".join(hex_digest[i:i + 4] for i in range(0, len(hex_digest), 4))
 
 
 
@@ -490,7 +580,8 @@ class CryptoLayer:
 
         # Ожидаем отправления всех пакетов
         timeout = 30
-        while len(self.TRANSPORT_LEVEL.PENDING_ACK_PACKS) > 0 or len(self.APPLICATION_LEVEL.PENDING_SEND_BUF) > 0 or len(self.PRESENTATION_LEVEL.PENDING_SEND_BUF) > 0 or len(self.TRANSPORT_LEVEL.PENDING_SEND_BUF) > 0 or len(self.TRANSITIONAL_LEVEL.PENDING_SEND_BUF) > 0:
+        levels = (self.APPLICATION_LEVEL, self.PRESENTATION_LEVEL, self.TRANSPORT_LEVEL, self.TRANSITIONAL_LEVEL)
+        while self.TRANSPORT_LEVEL.PENDING_ACK_PACKS or any(level.PENDING_SEND_BUF.qsize() for level in levels):
 
             if timeout <= 0:
                 break
