@@ -5,6 +5,7 @@ import os
 import re
 import uuid
 import logging
+import hashlib
 
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
@@ -277,6 +278,11 @@ class CryptoLayer:
         # Отправка своей подписи
         # Ожидание подписи собеседника
 
+        # Станет True только если подпись собеседника действительно принята:
+        # либо совпала с ранее сохранённой, либо подтверждена пользователем.
+        # Управляет включением доверия в блоке finally ниже.
+        trust_ok = False
+
         try:
             self.ui_provider.update_status("Signatures", "Send signature...", "in_progress")
             self.LOGGER.info("Signatures: Send signature...")
@@ -306,6 +312,8 @@ class CryptoLayer:
                         # Все норм они равны. Можем переходить к следующему этапу
                         self.ui_provider.update_status("Signatures", "Companion signature exists", "in_progress")
                         self.LOGGER.info("Signatures: Companion signature exists")
+                        # Подпись совпала с ранее сохранённой для этого узла - доверяем ей.
+                        trust_ok = True
                         return
 
                     else:
@@ -326,7 +334,7 @@ class CryptoLayer:
             self.LOGGER.info("Signatures: user signatures check...")
 
             # Проверка подписи собеседника пользователем
-            if self.ui_provider.check_signatures(self.get_firts_last_4_chars_sign(self.SIGN_PUBLIC_KEY), self.get_firts_last_4_chars_sign(self.COMPANION_SIGN)):
+            if self.ui_provider.check_signatures(self.get_sign_fingerprint(self.SIGN_PUBLIC_KEY), self.get_sign_fingerprint(self.COMPANION_SIGN)):
 
                 # Доверяем, записываем, используем эту подпись
 
@@ -337,13 +345,17 @@ class CryptoLayer:
                 comp_sign_public_bytes_X962 = self.get_key_bytes_X962(self.COMPANION_SIGN)
                 self.encrypt_write_file(COMPANION_SIGN_FILE_PATH, self.USER_PASSWORD, comp_sign_public_bytes_X962)
 
+                # Пользователь сверил отпечаток и подтвердил его - доверяем подписи.
+                trust_ok = True
+
 
             else:
                 raise TypeError("do not trust the signature")
 
         finally:
-            self.TRANSITIONAL_LEVEL.COMPANION_SIGN_PUBLIC_KEY = self.COMPANION_SIGN # обновляем подпись собеседника
-            self.TRANSITIONAL_LEVEL.DO_SIGN = True # ОБЯЗАТЕЛЬНО!!! Так как теперь используется подпись
+            if trust_ok:
+                self.TRANSITIONAL_LEVEL.COMPANION_SIGN_PUBLIC_KEY = self.COMPANION_SIGN # обновляем подпись собеседника
+                self.TRANSITIONAL_LEVEL.DO_SIGN = True # ОБЯЗАТЕЛЬНО!!! Так как теперь используется подпись
 
 
     # Генерация и обмен публичными ключами, вычисление симметриного ключа
@@ -380,7 +392,24 @@ class CryptoLayer:
         # Вычисление симетричного ключа
         self.ui_provider.update_status("Encryption", "Symmetric key computation...", "in_progress")
         self.LOGGER.info("Encryption: Symmetric key computation...")
-        self.AES_KEY = self.MY_PRIVATE_KEY.exchange(ec.ECDH(), self.COMPANION_PUBLIC_KEY)
+        shared_secret = self.MY_PRIVATE_KEY.exchange(ec.ECDH(), self.COMPANION_PUBLIC_KEY)
+
+        # Результат ECDH - сам по себе он никак не привязан к тому, между кем
+        # шёл обмен. Поэтому не отдаём его в AES напрямую, а прогоняем через HKDF и
+        # подмешиваем в контекст оба публичных ключа и метку протокола. Порядок ключей
+        # фиксируем сортировкой, чтобы обе стороны независимо получили одинаковый
+        # контекст. В итоге ключ шифрования равномерный и жёстко связан именно с этой
+        # парой ключей и версией протокола: тот же секрет в другом контексте даст
+        # другой ключ, а переиспользовать секрет между сессиями не получится.
+        companion_public_key_bytes = self.get_key_bytes_X962(self.COMPANION_PUBLIC_KEY)
+        low_key, high_key = sorted((my_pkey_bytes, companion_public_key_bytes))
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"cryptolayer ecdh-aes256 v1\x00" + low_key + high_key,
+        )
+        self.AES_KEY = hkdf.derive(shared_secret)
 
         self.PRESENTATION_LEVEL.DO_ENCRYPT = True
         self.PRESENTATION_LEVEL.AES_KEY = self.AES_KEY
@@ -523,17 +552,20 @@ class CryptoLayer:
             self.USER_PASSWORD[i] = 0
 
 
-    # Получить первые и последние 4 байта подписи
-    def get_firts_last_4_chars_sign(self, sign):
+    # Отпечаток публичного ключа подписи, который пользователи сверяют вручную по
+    # доверенному каналу. Это единственная защита от подмены ключей в момент
+    # установления доверия, поэтому отпечаток обязан зависеть от всего ключа целиком.
+    def get_sign_fingerprint(self, sign):
 
-        sign_public_bytes_pem = sign.public_bytes(
+        sign_public_bytes = sign.public_bytes(
             encoding=serialization.Encoding.X962,
             format=serialization.PublicFormat.CompressedPoint
         )
 
-        first_4 = sign_public_bytes_pem[:4]
-        last_4 = sign_public_bytes_pem[-4:]
-        return f"{first_4.hex()}...{last_4.hex()}"
+        # Хэшируем ключ целиком через SHA-256 и показываем первые 160 бит
+        digest = hashlib.sha256(sign_public_bytes).digest()[:20]
+        hex_digest = digest.hex()
+        return " ".join(hex_digest[i:i + 4] for i in range(0, len(hex_digest), 4))
 
 
 
