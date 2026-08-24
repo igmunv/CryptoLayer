@@ -121,6 +121,9 @@ class CryptoLayer:
         # удаление пароля из RAM
         self.remove_password_from_ram()
 
+        # Стек готов: только теперь имеет смысл проверять доступность собеседника
+        self.TRANSPORT_LEVEL.enable_ping()
+
         self.ui_provider.on_ready()
 
 
