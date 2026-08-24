@@ -278,4 +278,23 @@ class Transport(Base):
         self.CURRENT_STREAM_ID = (self.CURRENT_STREAM_ID + 1) % 256
 
 
+    # PUBLIC функция: её вызывает ядро.
+    # Отбросить уже принятые пакеты с данными и незавершённые потоки.
+    # Подтверждения и пинги не трогаем: на них завязана доставка
+    def drop_pending_data(self):
+
+        for raw_packet_bytes in self.take_pending_processing():
+
+            try:
+                packet = TransportPacket.from_bytes(raw_packet_bytes)
+            except Exception as e:
+                self.logger.error(e)
+                continue
+
+            if packet.flags != 0x0:
+                self.PENDING_PROCESSING_BUF.put(raw_packet_bytes)
+
+        self.WAITING_STREAMS.clear()
+
+
 

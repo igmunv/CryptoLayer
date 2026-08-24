@@ -53,6 +53,19 @@ class Base:
         self.PENDING_PROCESSING_BUF.put(data)
 
 
+    # PUBLIC функция: забрать всё, что сейчас лежит в буффере приёма.
+    # Нужна, чтобы отбросить данные, пришедшие до того, как собеседник был проверен
+    def take_pending_processing(self):
+
+        taken = []
+
+        while True:
+            try:
+                taken.append(self.PENDING_PROCESSING_BUF.get_nowait())
+            except queue.Empty:
+                return taken
+
+
     # Отдаёт рабочей функции всё, что попадает в буффер, пока не выставлен stop_event.
     # Обработчик вызывается вне блокировки буффера: transport ждёт подтверждения
     # секундами, и держать буффер занятым всё это время значит застопорить уровни выше.

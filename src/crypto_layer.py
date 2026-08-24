@@ -356,6 +356,11 @@ class CryptoLayer:
                 format=serialization.PublicFormat.CompressedPoint
             )
 
+        # Всё, что пришло до включения обязательной проверки подписей, могло быть
+        # отправлено кем угодно. Отбрасываем такие данные и только после этого
+        # разрешаем приём ECDH-ключа собеседника
+        self.drop_unauthenticated_data()
+
         # Передача публичного ключа
         # Ожидаем публичный ключ от собеседника
         self.ui_provider.update_status("Encryption", "Send public key...", "in_progress")
@@ -378,6 +383,21 @@ class CryptoLayer:
         self.PRESENTATION_LEVEL.AES_KEY = self.AES_KEY
 
         self.ui_provider.update_status("Encryption", "Done", "success")
+
+
+    # Отбросить всё, что пришло до включения обязательной проверки подписей,
+    # и разрешить приём ECDH-ключа собеседника.
+    # Вызывать только после DO_SIGN = True: данные, ещё не дошедшие до переходного
+    # уровня, будут проверены при обработке, поэтому чистим только то, что этот
+    # уровень уже успел пропустить. Уровни чистятся снизу вверх
+    def drop_unauthenticated_data(self):
+
+        self.TRANSPORT_LEVEL.drop_pending_data()
+        self.PRESENTATION_LEVEL.take_pending_processing()
+
+        # Буфер прикладного уровня чистится внутри expect_public_key под тем же
+        # замком, под которым выполняется его rworker
+        self.APPLICATION_LEVEL.expect_public_key()
 
 
     # Отправка сообщения
