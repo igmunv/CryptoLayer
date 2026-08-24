@@ -57,6 +57,12 @@ class Transitional(Base):
     # постоянно читает PENDING_SEND_BUF, формирует пакет и отправляет данные ниже
     def sworker(self, data):
 
+        # Ключ подписи появляется только в signatures_setup, а пакеты нижних уровней
+        # (например, ping) могут попасть сюда раньше - подписать их нечем
+        if self.SIGN_PRIVATE_KEY is None:
+            self.logger.warning(f"signature key is not ready yet: packet dropped")
+            return
+
         signature = self.SIGN_PRIVATE_KEY.sign(
             data,
             ec.ECDSA(hashes.SHA256())

@@ -48,6 +48,10 @@ class Transport(Base):
         # Размер чанков данных в байтах
         self.CHUNK_SIZE = 100
 
+        # Пинг включается ядром после инициализации. До этого стек ещё не готов
+        # отправлять пакеты, а само рукопожатие подтверждает, что собеседник на месте
+        self.PING_ENABLED = False
+
         threading.Thread(target=self.every_second).start()
 
 
@@ -56,7 +60,7 @@ class Transport(Base):
         while not self.stop_event.is_set():
 
             # Если больше 30 секунд от собеседника не приходило ни одного пакета, то отправляем пинг
-            if self.TIME_SINCE_LAST_PACKET > 30:
+            if self.PING_ENABLED and self.TIME_SINCE_LAST_PACKET > 30:
                 self.send_with_pending_ping()
 
             # Прибавляем единицу, чтобы понимать сколько прошло секунд с получения последнего пакета
@@ -64,6 +68,16 @@ class Transport(Base):
                 self.TIME_SINCE_LAST_PACKET += 1
 
             time.sleep(1)
+
+
+    # PUBLIC функция: её вызывает ядро, когда стек полностью проинициализирован.
+    # Счётчик обнуляется: рукопожатие только что прошло, собеседник точно на месте
+    def enable_ping(self):
+
+        with self.TIME_SINCE_LAST_PACKET_LOCK:
+            self.TIME_SINCE_LAST_PACKET = 0
+
+        self.PING_ENABLED = True
 
 
     # Отправка ping, для проверки доступности собеседника, и ожидание ответа
