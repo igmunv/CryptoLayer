@@ -114,16 +114,28 @@ class Application(Base):
                 if not self.check_stage(HandshakeStages.WAIT_NODE_ID, "MY_NODE_ID"):
                     return
 
+                # node id приходит по сети и может быть мусором
+                try:
+                    node_id = packet.payload.decode()
+                except UnicodeDecodeError:
+                    self.logger.warning("MY_NODE_ID payload is not valid utf-8: dropped")
+                    return
+
+                if not self.UPPER_LEVEL.receive_node_id(node_id):
+                    return
+
                 self.HANDSHAKE_STAGE = HandshakeStages.WAIT_SIGN
-                self.UPPER_LEVEL.receive_node_id(packet.payload.decode())
 
             elif packet.data_type == CMDTypes.MY_SIGN.value:
 
                 if not self.check_stage(HandshakeStages.WAIT_SIGN, "MY_SIGN"):
                     return
 
+                # Та же логика, что и для node id: разбор подписи может завершиться ошибкой
+                if not self.UPPER_LEVEL.receive_sign(packet.payload):
+                    return
+
                 self.HANDSHAKE_STAGE = HandshakeStages.SIGN_RECEIVED
-                self.UPPER_LEVEL.receive_sign(packet.payload)
 
             elif packet.data_type == CMDTypes.MY_PUBLIC_KEY.value:
 
@@ -133,8 +145,12 @@ class Application(Base):
                     self.logger.info(f"MY_PUBLIC_KEY packet at stage {self.HANDSHAKE_STAGE.name}: dropped")
                     return
 
+                # Аналогично node id и подписи: ECDH-ключ разбирается в ядре и
+                # может оказаться некорректным
+                if not self.UPPER_LEVEL.receive_public_key(packet.payload):
+                    return
+
                 self.HANDSHAKE_STAGE = HandshakeStages.READY
-                self.UPPER_LEVEL.receive_public_key(packet.payload)
 
                 # Наш ключ собеседник мог отбросить, если получил его до того,
                 # как включил у себя проверку подписей. Отправляем ещё раз
