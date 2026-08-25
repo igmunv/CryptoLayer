@@ -22,6 +22,18 @@ class Transport(Base):
     # Сколько чанков одного потока держать в полёте одновременно
     SEND_WINDOW = 8
 
+    # Сколько ждать продолжения незавершённого потока, прежде чем выбросить его
+    STREAM_TIMEOUT = ACK_TIMEOUT * ACK_RETRIES
+
+    # Границы незавершённых потоков
+    MAX_WAITING_STREAMS = 8
+    MAX_STREAM_CHUNKS = 4096
+    MAX_STREAM_BYTES = 1024 * 1024
+
+    # Пакет старше PACKET_MAX_AGE отбрасывается
+    PACKET_MAX_AGE = 300
+    CLOCK_SKEW_TOLERANCE = 60
+
 
     def __init__(self):
         super().__init__()
@@ -179,6 +191,62 @@ class Transport(Base):
         return False
 
 
+    # Границы заголовка потока
+    def valid_stream_header(self, packet):
+
+        if packet.chunk_count == 0 or packet.chunk_count > self.MAX_STREAM_CHUNKS:
+            self.logger.warning(f"bogus chunk count {packet.chunk_count}: packet dropped")
+            return False
+
+        if packet.chunk_id >= packet.chunk_count:
+            self.logger.warning(f"chunk id {packet.chunk_id} out of range for {packet.chunk_count} chunk(s): packet dropped")
+            return False
+
+        if packet.size > self.MAX_STREAM_BYTES:
+            self.logger.warning(f"chunk of {packet.size} bytes exceeds the stream budget: packet dropped")
+            return False
+
+        return True
+
+
+    # Выбрасывает потоки, в которые давно ничего не приходило
+    def expire_waiting_streams(self):
+
+        now = time.monotonic()
+        expired = [stream_id for stream_id, stream in self.WAITING_STREAMS.items() if stream["deadline"] <= now]
+
+        for stream_id in expired:
+            self.logger.warning(f"stream {stream_id}: no chunks for {self.STREAM_TIMEOUT}s, incomplete stream dropped")
+            del self.WAITING_STREAMS[stream_id]
+
+
+    # Поток, в который ложится чанк. Создаёт запись, если потока ещё нет
+    def stream_for(self, packet):
+
+        stream = self.WAITING_STREAMS.get(packet.stream_id)
+
+        if stream is not None and stream["count"] != packet.chunk_count:
+            self.logger.warning(f"stream {packet.stream_id}: chunk count changed {stream['count']} -> {packet.chunk_count}, stale stream dropped")
+            del self.WAITING_STREAMS[packet.stream_id]
+            stream = None
+
+        if stream is None:
+            if len(self.WAITING_STREAMS) >= self.MAX_WAITING_STREAMS:
+                oldest_id = min(self.WAITING_STREAMS, key=lambda stream_id: self.WAITING_STREAMS[stream_id]["deadline"])
+                self.logger.warning(f"stream table is full: evicting the oldest stream {oldest_id}")
+                del self.WAITING_STREAMS[oldest_id]
+
+            stream = {
+                "count": packet.chunk_count,
+                "packets": {},
+                "bytes": 0,
+                "deadline": time.monotonic() + self.STREAM_TIMEOUT,
+            }
+            self.WAITING_STREAMS[packet.stream_id] = stream
+
+        return stream
+
+
     # постоянно читает данные из PENDING_PROCESSING_BUF и обрабатывает их и отправляет выше
     def rworker(self, data):
 
@@ -196,8 +264,8 @@ class Transport(Base):
         # Проверка на возраст пакета
         difference_seconds = int(time.time()) - packet.time
         # Если пакет старше 5 минут, отбрасываем
-        if difference_seconds >= 300:
-            self.logger.info(f"old packet. bye")
+        if difference_seconds >= self.PACKET_MAX_AGE or difference_seconds < -self.CLOCK_SKEW_TOLERANCE:
+            self.logger.info(f"packet timestamp is outside the accepted window ({difference_seconds}s). bye")
             return
 
         # Обнуляем счетчик секунд который означает сколько секунд прошло с момента получения последнего пакета
@@ -226,6 +294,10 @@ class Transport(Base):
 
             self.logger.info(f"data packet")
 
+            # Границы заголовка проверяем раньше подтверждения
+            if not self.valid_stream_header(packet):
+                return
+
             # Подтверждение отправляем всегда: отправитель повторяет пакет
             # именно потому, что не увидел предыдущего подтверждения
             self.send_acknowledgment(data)
@@ -236,12 +308,26 @@ class Transport(Base):
                 self.logger.info(f"duplicate packet, acknowledged and ignored")
                 return
 
+            # Брошенные потоки убираем прежде, чем разместить новый чанк:
+            # иначе огрызок дождётся оборота stream_id и склеится с чужими данными
+            self.expire_waiting_streams()
+
+            stream = self.stream_for(packet)
+
+            if stream["bytes"] + packet.size > self.MAX_STREAM_BYTES:
+                self.logger.warning(f"stream {packet.stream_id}: over the {self.MAX_STREAM_BYTES} byte budget, dropped")
+                del self.WAITING_STREAMS[packet.stream_id]
+                return
+
             # Чанки лежат в словаре по chunk_id: повторно присланный чанк
             # перезаписывает себя же, а не задваивает счётчик
-            stream = self.WAITING_STREAMS.setdefault(
-                packet.stream_id, {"count": packet.chunk_count, "packets": {}}
-            )
+            if packet.chunk_id not in stream["packets"]:
+                stream["bytes"] += packet.size
             stream["packets"][packet.chunk_id] = packet.payload
+
+            # Каждый новый чанк продлевает жизнь потока: медленный канал с
+            # повторами не должен ронять сборку на полпути
+            stream["deadline"] = time.monotonic() + self.STREAM_TIMEOUT
 
             self.logger.info(f"stream {packet.stream_id}: {len(stream['packets'])} packet of {stream['count']}")
 
