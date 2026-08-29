@@ -26,6 +26,8 @@ class Transport(Base):
     STREAM_TIMEOUT = ACK_TIMEOUT * ACK_RETRIES
 
     # Границы незавершённых потоков
+    # WAITING_STREAMS живёт и после него. Поэтому пределы задаёт получатель,
+    # а не тот, кто прислал пакет
     MAX_WAITING_STREAMS = 8
     MAX_STREAM_CHUNKS = 4096
     MAX_STREAM_BYTES = 1024 * 1024
@@ -191,7 +193,8 @@ class Transport(Base):
         return False
 
 
-    # Границы заголовка потока
+    # Границы заголовка потока. Проверяем до любой аллокации: chunk_count приходит
+    # из канала, и поверить ему значит позволить любому желающему занять память
     def valid_stream_header(self, packet):
 
         if packet.chunk_count == 0 or packet.chunk_count > self.MAX_STREAM_CHUNKS:
@@ -209,7 +212,9 @@ class Transport(Base):
         return True
 
 
-    # Выбрасывает потоки, в которые давно ничего не приходило
+    # Выбрасывает потоки, в которые давно ничего не приходило. Без этого
+    # незавершённый поток остаётся в памяти навсегда, а после оборота stream_id
+    # через 256 чанки нового сообщения дописались бы в этот огрызок
     def expire_waiting_streams(self):
 
         now = time.monotonic()
@@ -225,12 +230,21 @@ class Transport(Base):
 
         stream = self.WAITING_STREAMS.get(packet.stream_id)
 
+        # Отправитель берётся за следующий stream_id только когда разошлись все
+        # чанки предыдущего, поэтому другое количество чанков под тем же id
+        # означает, что старый поток уже не соберётся: он либо остался от оборота
+        # stream_id, либо подброшен. Приоритет у свежего, иначе огрызок будет
+        # склеен с новым сообщением
         if stream is not None and stream["count"] != packet.chunk_count:
             self.logger.warning(f"stream {packet.stream_id}: chunk count changed {stream['count']} -> {packet.chunk_count}, stale stream dropped")
             del self.WAITING_STREAMS[packet.stream_id]
             stream = None
 
         if stream is None:
+
+            # Таблица потоков не должна расти от того, что кто-то присылает
+            # начала потоков и не присылает продолжения. Вытесняем самый
+            # засидевшийся: иначе мусор занял бы все места до истечения таймаута
             if len(self.WAITING_STREAMS) >= self.MAX_WAITING_STREAMS:
                 oldest_id = min(self.WAITING_STREAMS, key=lambda stream_id: self.WAITING_STREAMS[stream_id]["deadline"])
                 self.logger.warning(f"stream table is full: evicting the oldest stream {oldest_id}")
@@ -263,7 +277,9 @@ class Transport(Base):
 
         # Проверка на возраст пакета
         difference_seconds = int(time.time()) - packet.time
-        # Если пакет старше 5 минут, отбрасываем
+        # Если пакет старше 5 минут, отбрасываем. Отрицательная разница означает время
+        # из будущего: такой пакет не устареет никогда и остаётся годным для повтора
+        # хоть через сутки, поэтому в минус допускаем только расхождение часов
         if difference_seconds >= self.PACKET_MAX_AGE or difference_seconds < -self.CLOCK_SKEW_TOLERANCE:
             self.logger.info(f"packet timestamp is outside the accepted window ({difference_seconds}s). bye")
             return
@@ -294,7 +310,8 @@ class Transport(Base):
 
             self.logger.info(f"data packet")
 
-            # Границы заголовка проверяем раньше подтверждения
+            # Границы заголовка проверяем раньше подтверждения: пакет, который мы
+            # всё равно не примем, не должен ни занимать память, ни получать ответ
             if not self.valid_stream_header(packet):
                 return
 
