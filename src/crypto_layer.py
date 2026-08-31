@@ -28,6 +28,11 @@ from UIProvider import UIProvider
 # node id состоит только из шестнадцатеричных символов
 NODE_ID_PATTERN = re.compile(r"\A[0-9a-f]+\Z")
 
+# Длина точки кривой SECP256R1 в сжатом формате X9.62: префикс + координата X.
+# Обе стороны отправляют ключи только в этом формате, поэтому всё остальное
+# отбрасывается ещё до разбора
+EC_COMPRESSED_POINT_LENGTH = 33
+
 
 class CryptoLayer:
 
@@ -91,6 +96,14 @@ class CryptoLayer:
         self.COMPANION_SIGN_RECEIVED = threading.Event()
         self.COMPANION_PUBLIC_KEY_RECEIVED = threading.Event()
 
+        # Ограничение на время ожидания шагов рукопожатия (в секундах).
+        self.HANDSHAKE_TIMEOUT = (
+            getattr(module_class, "handshake_timeout", None) or config.HANDSHAKE_TIMEOUT
+        )
+
+        # Отдельный лимит для шага, который ждёт действия человека
+        self.HANDSHAKE_USER_CHECK_TIMEOUT = config.HANDSHAKE_USER_CHECK_TIMEOUT
+
         # Уровни
         self.TRANSITIONAL_LEVEL = None
         self.TRANSPORT_LEVEL = None
@@ -113,11 +126,23 @@ class CryptoLayer:
         # Настройка модуля
         self.init_module()
 
-        # Работа с подписями
-        self.signatures_setup()
+        # Рукопожатие может не состояться: собеседник не ответил, прислал данные,
+        # которые ядро не приняло, или пользователь не подтвердил отпечаток.
+        # Тогда init() не оставляет после себя работающий стек и полуготовый
+        # объект: сообщаем в UI, гасим уровни и пробрасываем ошибку вызывающему
+        try:
 
-        # Ключи шифрования
-        self.generate_and_exchange_ecc_keys()
+            # Работа с подписями
+            self.signatures_setup()
+
+            # Ключи шифрования
+            self.generate_and_exchange_ecc_keys()
+
+        except Exception as e:
+            self.LOGGER.error(f"Init: initialization failed: {e}")
+            self.ui_provider.update_status("CryptoLayer", f"Initialization failed: {e}", "error")
+            self.abort_init()
+            raise
 
         # удаление пароля из RAM
         self.remove_password_from_ram()
@@ -126,6 +151,15 @@ class CryptoLayer:
         self.TRANSPORT_LEVEL.enable_ping()
 
         self.ui_provider.on_ready()
+
+
+    # Свертываем незавершённую инициализацию.
+    def abort_init(self):
+
+        self.remove_password_from_ram()
+
+        Base.stop_event.set()
+        BaseModule.stop_event.set()
 
 
     def init_levels(self):
@@ -267,7 +301,7 @@ class CryptoLayer:
         self.APPLICATION_LEVEL.send_my_node_id(self.NODE_ID)
         self.ui_provider.update_status("Signatures", "Waiting for companion node id...", "in_progress")
         self.LOGGER.info("Signatures: Waiting for companion node id...")
-        self.COMPANION_NODE_ID_RECEIVED.wait()
+        self.wait_handshake_step(self.COMPANION_NODE_ID_RECEIVED, "companion node id")
         self.ui_provider.update_status("Signatures", "Companion node id received!", "in_progress")
         self.LOGGER.info("Signatures: Companion node id received!")
 
@@ -290,7 +324,7 @@ class CryptoLayer:
             self.APPLICATION_LEVEL.send_my_sign(my_sign_public_bytes_X962)
             self.ui_provider.update_status("Signatures", "Waiting for companion signature...", "in_progress")
             self.LOGGER.info("Signatures: Waiting for companion signature...")
-            self.COMPANION_SIGN_RECEIVED.wait()
+            self.wait_handshake_step(self.COMPANION_SIGN_RECEIVED, "companion signature")
             self.ui_provider.update_status("Signatures", "Companion signature received!", "in_progress")
             self.LOGGER.info("Signatures: Companion signature received!")
 
@@ -384,7 +418,13 @@ class CryptoLayer:
 
         self.ui_provider.update_status("Encryption", "Waiting for companion public key...", "in_progress")
         self.LOGGER.info("Encryption: Waiting for companion public key...")
-        self.COMPANION_PUBLIC_KEY_RECEIVED.wait()
+        # Собеседник отправляет ключ только после ручной сверки отпечатка,
+        # поэтому здесь ждём дольше, чем на остальных шагах
+        self.wait_handshake_step(
+            self.COMPANION_PUBLIC_KEY_RECEIVED,
+            "companion public key",
+            self.HANDSHAKE_USER_CHECK_TIMEOUT
+        )
 
         self.ui_provider.update_status("Encryption", "Companion public key received!", "in_progress")
         self.LOGGER.info("Encryption: Companion public key received!")
@@ -437,32 +477,76 @@ class CryptoLayer:
         self.APPLICATION_LEVEL.send_text(text)
 
 
-    def receive_node_id(self, node_id: str):
+    # Ожидание шага рукопожатия с ограничением по времени. Возвращает управление
+    # при получении данных, а при таймауте прерывает рукопожатие исключением,
+    # чтобы поток инициализации не оставался заблокированным навсегда.
+    # Шаг, ждущий действия человека, передаёт свой лимит явно
+    def wait_handshake_step(self, event: threading.Event, step_name: str, timeout: float = None):
+
+        if timeout is None:
+            timeout = self.HANDSHAKE_TIMEOUT
+
+        if not event.wait(timeout):
+            self.LOGGER.error(f"Handshake timed out after {timeout}s while waiting for {step_name}")
+            raise TimeoutError(f"handshake timed out after {timeout}s while waiting for {step_name}")
+
+
+    def receive_node_id(self, node_id: str) -> bool:
 
         # node id собеседника приходит по сети и используется как имя файла
         # в known_nodes, поэтому принимается только node id ожидаемого вида
         if not self.check_node_id(node_id):
             self.LOGGER.error("companion node id is not valid: dropped")
-            return
+            return False
 
         self.COMPANION_NODE_ID = node_id
         self.COMPANION_NODE_ID_RECEIVED.set()
+        return True
 
 
-    def receive_sign(self, sign: bytes):
-        self.COMPANION_SIGN = ec.EllipticCurvePublicKey.from_encoded_point(
-            ec.SECP256R1(),
-            sign
-        )
+    def receive_sign(self, sign: bytes) -> bool:
+
+        # Подпись приходит по сети как байты точки кривой и может быть
+        # некорректной. Разбор изолируем: при ошибке возвращаем False, чтобы
+        # уровень приложения не переключал этап и сохранил возможность принять
+        # корректную подпись
+        if len(sign) != EC_COMPRESSED_POINT_LENGTH:
+            self.LOGGER.error("companion signature has unexpected length: dropped")
+            return False
+
+        try:
+            self.COMPANION_SIGN = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256R1(),
+                sign
+            )
+        except (ValueError, TypeError):
+            self.LOGGER.error("companion signature is not a valid EC point: dropped")
+            return False
+
         self.COMPANION_SIGN_RECEIVED.set()
+        return True
 
 
-    def receive_public_key(self, public_key: bytes):
-        self.COMPANION_PUBLIC_KEY = ec.EllipticCurvePublicKey.from_encoded_point(
-            ec.SECP256R1(),
-            public_key
-        )
+    def receive_public_key(self, public_key: bytes) -> bool:
+
+        # ECDH-ключ собеседника тоже приходит по сети и может быть некорректным.
+        # Разбор изолируем и сообщаем результат наверх по той же причине, что и
+        # для подписи
+        if len(public_key) != EC_COMPRESSED_POINT_LENGTH:
+            self.LOGGER.error("companion public key has unexpected length: dropped")
+            return False
+
+        try:
+            self.COMPANION_PUBLIC_KEY = ec.EllipticCurvePublicKey.from_encoded_point(
+                ec.SECP256R1(),
+                public_key
+            )
+        except (ValueError, TypeError):
+            self.LOGGER.error("companion public key is not a valid EC point: dropped")
+            return False
+
         self.COMPANION_PUBLIC_KEY_RECEIVED.set()
+        return True
 
 
     def receive_text(self, timestamp: int, text: str):
