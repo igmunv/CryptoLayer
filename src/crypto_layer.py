@@ -97,7 +97,9 @@ class CryptoLayer:
         self.COMPANION_PUBLIC_KEY_RECEIVED = threading.Event()
 
         # Ограничение на время ожидания шагов рукопожатия (в секундах).
-        self.HANDSHAKE_TIMEOUT = config.HANDSHAKE_TIMEOUT
+        self.HANDSHAKE_TIMEOUT = (
+            getattr(module_class, "handshake_timeout", None) or config.HANDSHAKE_TIMEOUT
+        )
 
         # Отдельный лимит для шага, который ждёт действия человека
         self.HANDSHAKE_USER_CHECK_TIMEOUT = config.HANDSHAKE_USER_CHECK_TIMEOUT

@@ -617,6 +617,23 @@ The `create_session` function takes one argument: `ingester` - a function is pas
 
 You can override `__init__` for Sender and Listener if you need to pass other variables. The main thing is to pass `ingester` to the Listener, as without it, data will not be passed to CryptoLayer.
 
+#### 9. Optional field handshake_timeout
+
+Handshake steps wait for the companion no longer than `HANDSHAKE_TIMEOUT` seconds (`60` by default, the value lives in `src/config.py`). If your channel is slow - the module polls the messenger once a minute, messages arrive with a delay - a minute may not be enough, and the handshake will time out even with an honest companion.
+
+To avoid that, set the `handshake_timeout` field on your class, in seconds:
+
+```python
+class Example(BaseModule):
+...
+handshake_timeout = 300
+...
+```
+
+The field is optional: without it CryptoLayer falls back to the value from `src/config.py`, so existing modules keep working unchanged. The user can override your estimate in the same file if it does not fit their conditions.
+
+The separate `HANDSHAKE_USER_CHECK_TIMEOUT` limit (`900` by default) ignores `handshake_timeout`: that step waits for a human to compare the signature fingerprint, not for the channel.
+
 ### 5.3. Testing your own module
 
 To test your module, you can use [CryptoLayer CLI](https://github.com/igmunv/cryptolayer-cli).
